@@ -1,5 +1,6 @@
 #include "ScopeScreen.h"
-#include "HamegLookAndFeel.h"
+#include <climits>
+#include "BraunLookAndFeel.h"
 
 using namespace juce;
 
@@ -26,6 +27,9 @@ ScopeScreen::ScopeScreen (PhosphorProcessor& p)
     focus    = s.getRawParameterValue ("focus");
     persist  = s.getRawParameterValue ("persist");
     illum    = s.getRawParameterValue ("illum");
+    fxCurve  = s.getRawParameterValue ("fx_curve");
+    fxScan   = s.getRawParameterValue ("fx_scan");
+    fxGlitch = s.getRawParameterValue ("fx_glitch");
 
     setOpaque (true);
 }
@@ -35,6 +39,15 @@ void ScopeScreen::resized()
     const int w = jmax (1, getWidth()), h = jmax (1, getHeight());
     persistImage = Image (Image::ARGB, w, h, true, SoftwareImageType());
     persistImage.clear (persistImage.getBounds(), Colours::black);
+    frameImage = Image (Image::ARGB, w, h, true, SoftwareImageType());
+    outImage = Image (Image::ARGB, w, h, true, SoftwareImageType());
+
+    rowDx.assign ((size_t) h, 0);
+    rowSplit.assign ((size_t) h, 0);
+    bands.clear();
+    mapW = mapH = 0;          // force le recalcul de la courbure
+    scanBuiltFor = -1.0f;     // et des lignes de balayage
+
     rebuildGraticule();
 }
 
@@ -93,11 +106,187 @@ void ScopeScreen::fadeImage (int k256)
     }
 }
 
+//==============================================================================
+// Effets d'image
+
+void ScopeScreen::rebuildMap (float curve)
+{
+    const int w = getWidth(), h = getHeight();
+    mapX.assign ((size_t) (w * h), 0);
+    mapY.assign ((size_t) (w * h), 0);
+
+    // distorsion en barillet : les bords se courbent, les coins s'arrondissent
+    const float k = curve * 0.22f;
+    for (int y = 0; y < h; ++y)
+    {
+        const float v = ((float) y + 0.5f) / (float) h * 2.0f - 1.0f;
+        for (int x = 0; x < w; ++x)
+        {
+            const float u = ((float) x + 0.5f) / (float) w * 2.0f - 1.0f;
+            const float sx = u * (1.0f + k * v * v);
+            const float sy = v * (1.0f + k * u * u);
+            const float px = (sx + 1.0f) * 0.5f * (float) w - 0.5f;
+            const float py = (sy + 1.0f) * 0.5f * (float) h - 0.5f;
+
+            const size_t i = (size_t) (y * w + x);
+            if (px < -0.5f || py < -0.5f || px > (float) w - 0.5f || py > (float) h - 0.5f)
+            {
+                mapX[i] = INT_MIN;      // en dehors de l'image : noir
+            }
+            else
+            {
+                mapX[i] = (int) (px * 65536.0f);
+                mapY[i] = (int) (py * 65536.0f);
+            }
+        }
+    }
+
+    mapCurve = curve;
+    mapW = w;
+    mapH = h;
+}
+
+static inline void bilinear (const uint8* base, int pixelStride, int lineStride, int w, int h,
+                             int sx, int sy, uint8* out)
+{
+    int x0 = sx >> 16, y0 = sy >> 16;
+    const int fx = (sx >> 8) & 255, fy = (sy >> 8) & 255;
+    int x1 = x0 + 1, y1 = y0 + 1;
+    x0 = jlimit (0, w - 1, x0);  x1 = jlimit (0, w - 1, x1);
+    y0 = jlimit (0, h - 1, y0);  y1 = jlimit (0, h - 1, y1);
+
+    const uint8* p00 = base + y0 * lineStride + x0 * pixelStride;
+    const uint8* p01 = base + y0 * lineStride + x1 * pixelStride;
+    const uint8* p10 = base + y1 * lineStride + x0 * pixelStride;
+    const uint8* p11 = base + y1 * lineStride + x1 * pixelStride;
+
+    for (int c = 0; c < 3; ++c)
+    {
+        const int top = p00[c] * (256 - fx) + p01[c] * fx;
+        const int bot = p10[c] * (256 - fx) + p11[c] * fx;
+        out[c] = (uint8) ((top * (256 - fy) + bot * fy) >> 16);
+    }
+}
+
+void ScopeScreen::applyRemap()
+{
+    Image::BitmapData src (frameImage, Image::BitmapData::readOnly);
+    Image::BitmapData dst (outImage, Image::BitmapData::writeOnly);
+    const int w = src.width, h = src.height;
+    const uint8* base = src.getLinePointer (0);
+    const int ps = src.pixelStride, ls = src.lineStride;
+
+    for (int y = 0; y < h; ++y)
+    {
+        auto* d = dst.getLinePointer (y);
+        const int dx = rowDx[(size_t) y] * 65536;
+        const int split = rowSplit[(size_t) y] * 65536;
+        const int dy = vJump * 65536;
+
+        for (int x = 0; x < w; ++x)
+        {
+            auto* px = d + x * dst.pixelStride;
+            const size_t i = (size_t) (y * w + x);
+
+            if (mapX[i] == INT_MIN)
+            {
+                px[0] = px[1] = px[2] = 0;
+                px[3] = 255;
+                continue;
+            }
+
+            const int sx = mapX[i] + dx, sy = mapY[i] + dy;
+            if (split == 0)
+            {
+                bilinear (base, ps, ls, w, h, sx, sy, px);
+            }
+            else
+            {
+                // separation des couleurs : rouge et bleu decales de part et d'autre du vert
+                uint8 t[3];
+                bilinear (base, ps, ls, w, h, sx, sy, t);            px[1] = t[1];
+                bilinear (base, ps, ls, w, h, sx + split, sy, t);    px[2] = t[2];
+                bilinear (base, ps, ls, w, h, sx - split, sy, t);    px[0] = t[0];
+            }
+            px[3] = 255;
+        }
+    }
+}
+
+void ScopeScreen::rebuildScan (float amount)
+{
+    const int w = getWidth(), h = getHeight();
+    scanImage = Image (Image::ARGB, jmax (1, w), jmax (1, h), true, SoftwareImageType());
+    Graphics g (scanImage);
+    g.setColour (Colours::black.withAlpha (amount * 0.40f));
+    for (int y = 1; y < h; y += 3)
+        g.fillRect (0, y, w, 1);
+    scanBuiltFor = amount;
+}
+
+void ScopeScreen::updateGlitch (float amount)
+{
+    const int h = getHeight();
+    if ((int) rowDx.size() != h)
+        return;
+
+    for (auto& b : bands)
+        --b.left;
+    bands.erase (std::remove_if (bands.begin(), bands.end(), [] (const GlitchBand& b) { return b.left <= 0; }), bands.end());
+
+    if (vJumpLeft > 0 && --vJumpLeft == 0)
+        vJump = 0;
+
+    if (amount > 0.001f)
+    {
+        // probabilite par image : ~0,4 glitch/s a 10 %, ~3/s a 50 %, ~10/s a 100 %
+        const float p = 0.005f + 0.17f * amount * amount;
+        if (rng.nextFloat() < p)
+        {
+            const int count = 1 + (amount > 0.5f ? rng.nextInt (3) : 0);
+            for (int i = 0; i < count; ++i)
+            {
+                GlitchBand b;
+                b.h = 3 + rng.nextInt ((int) (10.0f + amount * 70.0f));
+                b.y0 = rng.nextInt (jmax (1, h - b.h));
+                b.dx = (rng.nextBool() ? 1 : -1) * (4 + rng.nextInt ((int) (8.0f + amount * 90.0f)));
+                b.split = rng.nextFloat() < 0.6f ? 1 + rng.nextInt ((int) (2.0f + amount * 8.0f)) : 0;
+                b.left = 2 + rng.nextInt ((int) (2.0f + amount * 5.0f));
+                bands.push_back (b);
+            }
+        }
+
+        if (vJumpLeft == 0 && rng.nextFloat() < p * 0.25f)
+        {
+            vJump = (rng.nextBool() ? 1 : -1) * (2 + rng.nextInt ((int) (4.0f + amount * 24.0f)));
+            vJumpLeft = 2;
+        }
+    }
+    else
+    {
+        bands.clear();
+        vJump = 0;
+        vJumpLeft = 0;
+    }
+
+    std::fill (rowDx.begin(), rowDx.end(), 0);
+    std::fill (rowSplit.begin(), rowSplit.end(), 0);
+    for (const auto& b : bands)
+        for (int y = b.y0; y < jmin (h, b.y0 + b.h); ++y)
+        {
+            rowDx[(size_t) y] = b.dx;
+            rowSplit[(size_t) y] = b.split;
+        }
+}
+
+//==============================================================================
 void ScopeScreen::update()
 {
     const double now = Time::getMillisecondCounterHiRes();
     const double dt = jlimit (0.004, 0.1, (now - lastMs) * 0.001);
     lastMs = now;
+
+    updateGlitch (fxGlitch->load());
 
     if (persistImage.isNull() || hold->load() > 0.5f)
     {
@@ -294,6 +483,40 @@ void ScopeScreen::drawXY (Graphics& g, float intensity, float focusV)
     strokeBeam (g, path, Params::colourFor ((int) cp[0].colour->load()), intensity, focusV, count > 6000);
 }
 
+//==============================================================================
+void ScopeScreen::drawMarkers (Graphics& g)
+{
+    // reperes de position (gauche) et de niveau de declenchement (droite)
+    if (xyMode->load() > 0.5f)
+        return;
+
+    const float w = (float) getWidth();
+    const float cy = (float) getHeight() * 0.5f, divH = (float) getHeight() / 8.0f;
+
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        if (cp[ch].on->load() < 0.5f)
+            continue;
+
+        const auto c = Params::colourFor ((int) cp[ch].colour->load());
+        const float pos = cp[ch].pos->load();
+
+        const float y = cy - pos * divH;
+        Rectangle<float> tag (3.0f, y - 7.0f, 14.0f, 14.0f);
+        g.setColour (c.withAlpha (0.9f));
+        g.fillRoundedRectangle (tag, 2.0f);
+        g.setColour (Colours::black);
+        g.setFont (uiFont (10.0f, true));
+        g.drawText (String (ch + 1), tag.toNearestInt(), Justification::centred);
+
+        const float ty = cy - (cp[ch].level->load() + pos) * divH;
+        Path tri;
+        tri.addTriangle (w - 3.0f, ty, w - 13.0f, ty - 6.0f, w - 13.0f, ty + 6.0f);
+        g.setColour (c.withAlpha (0.85f));
+        g.fillPath (tri);
+    }
+}
+
 void ScopeScreen::paint (Graphics& g)
 {
     const auto b = getLocalBounds().toFloat();
@@ -302,38 +525,39 @@ void ScopeScreen::paint (Graphics& g)
     g.reduceClipRegion (clip, AffineTransform());
 
     g.fillAll (Colours::black);
-    g.setImageResamplingQuality (Graphics::highResamplingQuality);
-    g.drawImageAt (persistImage, 0, 0);
+    if (persistImage.isNull() || frameImage.isNull())
+        return;
 
-    g.setOpacity (jmap (illum->load(), 0.15f, 0.9f));
-    g.drawImageAt (graticule, 0, 0);
+    const float curve = fxCurve->load(), scan = fxScan->load(), glitch = fxGlitch->load();
+    const bool remap = curve > 0.01f || glitch > 0.001f || ! bands.empty() || vJump != 0;
 
-    // reperes de position (gauche) et de niveau de declenchement (droite)
-    if (xyMode->load() < 0.5f)
+    // image de l'ecran : phosphore + graticule + reperes
     {
-        const float cy = b.getHeight() * 0.5f, divH = b.getHeight() / 8.0f;
-        for (int ch = 0; ch < 2; ++ch)
-        {
-            if (cp[ch].on->load() < 0.5f)
-                continue;
+        Graphics fg (frameImage);
+        fg.drawImageAt (persistImage, 0, 0);
+        fg.setOpacity (jmap (illum->load(), 0.15f, 0.9f));
+        fg.drawImageAt (graticule, 0, 0);
+        drawMarkers (fg);
+    }
 
-            const auto c = Params::colourFor ((int) cp[ch].colour->load());
-            const float pos = cp[ch].pos->load();
+    if (remap)
+    {
+        if (mapW != getWidth() || mapH != getHeight() || std::abs (curve - mapCurve) > 0.002f)
+            rebuildMap (curve);
+        applyRemap();
+        g.drawImageAt (outImage, 0, 0);
+    }
+    else
+    {
+        g.drawImageAt (frameImage, 0, 0);
+    }
 
-            const float y = cy - pos * divH;
-            Rectangle<float> tag (3.0f, y - 7.0f, 14.0f, 14.0f);
-            g.setColour (c.withAlpha (0.9f));
-            g.fillRoundedRectangle (tag, 2.0f);
-            g.setColour (Colours::black);
-            g.setFont (uiFont (10.0f, true));
-            g.drawText (String (ch + 1), tag.toNearestInt(), Justification::centred);
-
-            const float ty = cy - (cp[ch].level->load() + pos) * divH;
-            Path tri;
-            tri.addTriangle (b.getRight() - 3.0f, ty, b.getRight() - 13.0f, ty - 6.0f, b.getRight() - 13.0f, ty + 6.0f);
-            g.setColour (c.withAlpha (0.85f));
-            g.fillPath (tri);
-        }
+    // lignes de balayage
+    if (scan > 0.01f)
+    {
+        if (std::abs (scan - scanBuiltFor) > 0.004f || scanImage.isNull())
+            rebuildScan (scan);
+        g.drawImageAt (scanImage, 0, 0);
     }
 
     // verre : vignettage et reflet

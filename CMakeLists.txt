@@ -34,6 +34,7 @@ juce_add_plugin(PhosphorXY
 target_sources(PhosphorXY PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
+    Source/TextShape.cpp
     Source/ScopeScreen.cpp)
 
 target_compile_definitions(PhosphorXY PUBLIC

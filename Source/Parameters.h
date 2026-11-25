@@ -12,6 +12,9 @@ namespace Params
     }
 
     inline const juce::StringArray colourNames { "Green", "Amber", "Cyan", "White", "Magenta", "Red" };
+    inline const juce::StringArray genModeNames  { "DRAW (XY)", "TONE (NOTES)" };
+    inline const juce::StringArray genSrcNames   { "INPUT ONLY", "INPUT + GEN", "GEN ONLY" };
+    inline const juce::StringArray genScaleNames { "MAJOR", "MINOR", "PENTATONIC", "CHROMATIC" };
 
     inline juce::Colour colourFor (int index)
     {
@@ -120,6 +123,27 @@ namespace Params
         layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "focus", 1 }, "Focus", unit, 0.7f, pct));
         layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "persist", 1 }, "Persistence", unit, 0.25f, pct));
         layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "illum", 1 }, "Graticule Illumination", unit, 0.6f, pct));
+
+        // generateur : texte -> forme d'onde (le texte lui-meme est stocke dans l'etat du plugin)
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "gen_src", 1 }, "Generator Source", genSrcNames, 0));
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "gen_mode", 1 }, "Generator Mode", genModeNames, 0));
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "gen_scale", 1 }, "Generator Scale", genScaleNames, 2));
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "gen_level", 1 }, "Generator Level", unit, 0.8f, pct));
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "gen_freq", 1 }, "Generator Pitch", logRange (20.0f, 2000.0f), 110.0f,
+            AudioParameterFloatAttributes()
+                .withStringFromValueFunction ([] (float v, int) { return String (roundToInt (v)) + " Hz"; })
+                .withValueFromStringFunction ([] (const String& t) { return t.getFloatValue(); })));
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "gen_step", 1 }, "Generator Step", logRange (60.0f, 1000.0f), 220.0f,
+            AudioParameterFloatAttributes()
+                .withStringFromValueFunction ([] (float v, int) { return String (roundToInt (v)) + " ms"; })
+                .withValueFromStringFunction ([] (const String& t) { return t.getFloatValue(); })));
+
+        // effets d'image (affichage seulement, n'affectent jamais le son)
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "fx_curve", 1 }, "FX Curvature", unit, 0.35f, pct));
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "fx_scan", 1 }, "FX Scanlines", unit, 0.3f, pct));
+        layout.add (std::make_unique<AudioParameterFloat> (ParameterID { "fx_glitch", 1 }, "FX Glitch", unit, 0.0f, pct));
 
         return layout;
     }
