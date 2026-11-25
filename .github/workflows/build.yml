@@ -1,0 +1,52 @@
+name: Build VST3
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: macos-latest
+            name: macOS
+          - os: ubuntu-latest
+            name: Linux
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependances Linux
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxcomposite-dev libxcursor-dev \
+            libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libfreetype-dev \
+            libfontconfig1-dev libgl1-mesa-dev
+
+      - name: Configurer
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "$RUNNER_OS" = "macOS" ]; then EXTRA='-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64'; fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF "$EXTRA"
+
+      - name: Compiler
+        run: cmake --build build --config Release --parallel
+
+      - name: Signature ad hoc (macOS)
+        if: runner.os == 'macOS'
+        run: codesign --force --deep -s - "build/PhosphorXY_artefacts/Release/VST3/Phosphor XY.vst3"
+
+      - name: Publier le VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhosphorXY-${{ matrix.name }}-VST3
+          path: build/PhosphorXY_artefacts/Release/VST3/
