@@ -45,8 +45,48 @@ jobs:
         if: runner.os == 'macOS'
         run: codesign --force --deep -s - "build/PhosphorXY_artefacts/Release/VST3/Phosphor XY.vst3"
 
-      - name: Publier le VST3
+      - name: Archive du plugin (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd build/PhosphorXY_artefacts/Release/VST3
+          ditto -c -k --keepParent "Phosphor XY.vst3" "$GITHUB_WORKSPACE/PhosphorXY-macOS.zip"
+
+      - name: Archive du plugin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "build/PhosphorXY_artefacts/Release/VST3/Phosphor XY.vst3" -DestinationPath PhosphorXY-Windows.zip
+
+      - name: Archive du plugin (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd build/PhosphorXY_artefacts/Release/VST3
+          zip -qr "$GITHUB_WORKSPACE/PhosphorXY-Linux.zip" "Phosphor XY.vst3"
+
+      - name: Publier l'artefact
         uses: actions/upload-artifact@v4
         with:
-          name: PhosphorXY-${{ matrix.name }}-VST3
-          path: build/PhosphorXY_artefacts/Release/VST3/
+          name: PhosphorXY-${{ matrix.name }}
+          path: PhosphorXY-${{ matrix.name }}.zip
+
+  # Publie les .zip sur une page de telechargement directe (sans compte GitHub necessaire).
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Creer la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --repo "${{ github.repository }}" --cleanup-tag -y || true
+          gh release create latest dist/*.zip --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Phosphor XY - dernier build" \
+            --notes "Telechargez le zip de votre systeme, decompressez-le, puis copiez Phosphor XY.vst3 (le dossier entier) dans votre dossier VST3."
